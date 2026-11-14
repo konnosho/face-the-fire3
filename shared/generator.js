@@ -193,8 +193,8 @@ function validate(o) {
 
 // ── Core ─────────────────────────────────────────────────────────────────────
 // Returns { status, body }. Wrappers only translate between platform request/response shapes.
-const VERSION = "v9";
-const MAX_TOKENS = 4000;
+const VERSION = "v10";
+const MAX_TOKENS = 2000;
 
 async function run({ mode, fields, ip, apiKey }) {
   if (!apiKey) return { status: 500, body: { error: "API key not configured on server." } };
@@ -209,12 +209,13 @@ async function run({ mode, fields, ip, apiKey }) {
 
   try {
     const body = {
-      model: "mistral-large-latest",
+      // mistral-large-latest now resolves to Mistral Large 4, a reasoning model where
+      // "none" is NOT a valid reasoning_effort — thinking always runs and ate the whole
+      // token budget (the v8/v9 bug). Pin Large 3 instead: non-reasoning, plain-string
+      // answers, faster and cheaper. Supported until 2027-04-30.
+      model: "mistral-large-2512",
       max_tokens: MAX_TOKENS,
       temperature: 0.8,
-      // Mistral's current large model can "think" before answering, which used up the whole
-      // token budget and left no answer. "none" switches thinking off and returns plain text.
-      reasoning_effort: "none",
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
@@ -231,9 +232,11 @@ async function run({ mode, fields, ip, apiKey }) {
       return { response: r, data: await r.json() };
     };
     let { response, data } = await call(body);
-    // If the model rejects the reasoning setting, retry once without it
-    if (!response.ok && /reasoning/i.test(JSON.stringify(data))) {
-      delete body.reasoning_effort;
+    // If Large 3 is unavailable on this plan, fall back to Large 4 with LOW reasoning
+    // (Large 4 supports only low/medium/high — "none" is invalid for it)
+    if (!response.ok && (response.status === 403 || response.status === 404 || /model/i.test(JSON.stringify(data)))) {
+      body.model = "mistral-large-4-0";
+      body.reasoning_effort = "low";
       ({ response, data } = await call(body));
     }
     if (!response.ok || !data.choices) {
@@ -245,14 +248,11 @@ async function run({ mode, fields, ip, apiKey }) {
     if (!parsed) {
       const used = data.usage && data.usage.completion_tokens;
       const finish = choice.finish_reason || "unknown";
-      // v9 diagnostics: dump the raw message so we can see where the tokens went
-      // (thinking trace, unexpected content shape, etc.)
-      const raw = JSON.stringify(choice.message || {}).slice(0, 600);
-      console.error("Unusable reply", { version: VERSION, finish, used, head: text.slice(0, 300), tail: text.slice(-200), raw });
+      console.error("Unusable reply", { version: VERSION, finish, used, head: text.slice(0, 300), tail: text.slice(-200) });
       const info = `${VERSION}, finish=${finish}, ${used ?? "?"}/${MAX_TOKENS} tokens, ${text.length} chars`;
       return { status: 502, body: { error: finish === "length"
         ? `The scenario was cut off before it finished (${info}). Please try again.`
-        : `The scenario came back in an unexpected format (${info}) [raw: ${raw}]. Please try again.` } };
+        : `The scenario came back in an unexpected format (${info}). Please try again.` } };
     }
     return { status: 200, body: parsed };
   } catch (err) {
