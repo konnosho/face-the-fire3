@@ -149,7 +149,7 @@ ${lines.join("\n")}`;
 // Mistral may return message.content as a string OR as an array of content chunks
 function contentToText(c) {
   if (typeof c === "string") return c;
-  if (Array.isArray(c)) return c.map((x) => (typeof x === "string" ? x : (x && x.text) || "")).join("");
+  if (Array.isArray(c)) return c.map((x) => (typeof x === "string" ? x : (x && (x.type === "text" || x.type === undefined) && x.text) || "")).join("");
   return "";
 }
 
@@ -193,7 +193,7 @@ function validate(o) {
 
 // ── Core ─────────────────────────────────────────────────────────────────────
 // Returns { status, body }. Wrappers only translate between platform request/response shapes.
-const VERSION = "v7";
+const VERSION = "v8";
 const MAX_TOKENS = 2000;
 
 async function run({ mode, fields, ip, apiKey }) {
@@ -208,22 +208,34 @@ async function run({ mode, fields, ip, apiKey }) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch("https://api.mistral.ai/v1/chat/completions", {
-      method: "POST",
-      signal: controller.signal,
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: "mistral-large-latest",
-        max_tokens: MAX_TOKENS,
-        temperature: 0.8,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: buildUserPrompt(mode === "custom" ? "custom" : "random", fields || {}) },
-        ],
-      }),
-    });
-    const data = await response.json();
+    const body = {
+      model: "mistral-large-latest",
+      max_tokens: MAX_TOKENS,
+      temperature: 0.8,
+      // Mistral's current large model can "think" before answering, which used up the whole
+      // token budget and left no answer. "none" switches thinking off and returns plain text.
+      reasoning_effort: "none",
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: buildUserPrompt(mode === "custom" ? "custom" : "random", fields || {}) },
+      ],
+    };
+    const call = async (b) => {
+      const r = await fetch("https://api.mistral.ai/v1/chat/completions", {
+        method: "POST",
+        signal: controller.signal,
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify(b),
+      });
+      return { response: r, data: await r.json() };
+    };
+    let { response, data } = await call(body);
+    // If the model rejects the reasoning setting, retry once without it
+    if (!response.ok && /reasoning/i.test(JSON.stringify(data))) {
+      delete body.reasoning_effort;
+      ({ response, data } = await call(body));
+    }
     if (!response.ok || !data.choices) {
       return { status: 502, body: { error: data.error?.message || data.message || "The AI service returned an error." } };
     }
