@@ -42,7 +42,7 @@ ADDITIONAL RULES:
 - Every scenario follows three stages: BACKGROUND (a realistic continuation of existing trends), DEVELOPMENT (warning signs, with the internal dilemma beginning to form), INCIDENT (a medium-to-high likelihood public escalation that clearly crosses the threshold for a public response, ending with an open question such as "How do you respond, and in what order?").
 - Tone: serious, documentary, present-tense. Not dramatic. Not over-written. Length limits (strict): each stage text at most 70 words, each note at most 30 words, the \"tests\" sentence at most 30 words.
 
-OUTPUT FORMAT — return ONLY valid compact JSON (no markdown fences, no indentation, no blank lines, no text before or after), in exactly this shape:
+OUTPUT FORMAT — return ONLY valid compact JSON (no markdown fences, no indentation, no blank lines, no text before or after), in exactly this shape. Output exactly ONE JSON object and then stop:
 {
   "type": "misrepresentation" | "ally" | "mistake",
   "stages": [
@@ -153,11 +153,31 @@ function contentToText(c) {
   return "";
 }
 
+// Parse the FIRST complete JSON object in the text (ignores anything the model writes after it,
+// such as a repeated copy), respecting braces inside strings.
 function extractJson(text) {
   text = contentToText(text);
-  const m = text.match(/\{[\s\S]*\}/);
-  if (!m) return null;
-  try { return JSON.parse(m[0]); } catch { return null; }
+  const start = text.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        try { return JSON.parse(text.slice(start, i + 1)); } catch { return null; }
+      }
+    }
+  }
+  return null;
 }
 
 function validate(o) {
@@ -173,7 +193,7 @@ function validate(o) {
 
 // ── Core ─────────────────────────────────────────────────────────────────────
 // Returns { status, body }. Wrappers only translate between platform request/response shapes.
-const VERSION = "v6";
+const VERSION = "v7";
 const MAX_TOKENS = 2000;
 
 async function run({ mode, fields, ip, apiKey }) {
@@ -214,7 +234,7 @@ async function run({ mode, fields, ip, apiKey }) {
       const used = data.usage && data.usage.completion_tokens;
       const finish = choice.finish_reason || "unknown";
       console.error("Unusable reply", { version: VERSION, finish, used, head: text.slice(0, 300), tail: text.slice(-200) });
-      const info = `${VERSION}, finish=${finish}, ${used ?? "?"}/${MAX_TOKENS} tokens`;
+      const info = `${VERSION}, finish=${finish}, ${used ?? "?"}/${MAX_TOKENS} tokens, ${text.length} chars`;
       return { status: 502, body: { error: finish === "length"
         ? `The scenario was cut off before it finished (${info}). Please try again.`
         : `The scenario came back in an unexpected format (${info}). Please try again.` } };
