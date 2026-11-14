@@ -42,7 +42,7 @@ ADDITIONAL RULES:
 - Every scenario follows three stages: BACKGROUND (a realistic continuation of existing trends), DEVELOPMENT (warning signs, with the internal dilemma beginning to form), INCIDENT (a medium-to-high likelihood public escalation that clearly crosses the threshold for a public response, ending with an open question such as "How do you respond, and in what order?").
 - Tone: serious, documentary, present-tense. Not dramatic. Not over-written. Length limits (strict): each stage text at most 70 words, each note at most 30 words, the \"tests\" sentence at most 30 words.
 
-OUTPUT FORMAT — return ONLY valid JSON, no markdown fences, in exactly this shape:
+OUTPUT FORMAT — return ONLY valid compact JSON (no markdown fences, no indentation, no blank lines, no text before or after), in exactly this shape:
 {
   "type": "misrepresentation" | "ally" | "mistake",
   "stages": [
@@ -173,6 +173,9 @@ function validate(o) {
 
 // ── Core ─────────────────────────────────────────────────────────────────────
 // Returns { status, body }. Wrappers only translate between platform request/response shapes.
+const VERSION = "v6";
+const MAX_TOKENS = 2000;
+
 async function run({ mode, fields, ip, apiKey }) {
   if (!apiKey) return { status: 500, body: { error: "API key not configured on server." } };
 
@@ -191,7 +194,7 @@ async function run({ mode, fields, ip, apiKey }) {
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model: "mistral-large-latest",
-        max_tokens: 2000,
+        max_tokens: MAX_TOKENS,
         temperature: 0.8,
         response_format: { type: "json_object" },
         messages: [
@@ -205,12 +208,16 @@ async function run({ mode, fields, ip, apiKey }) {
       return { status: 502, body: { error: data.error?.message || data.message || "The AI service returned an error." } };
     }
     const choice = data.choices[0] || {};
-    const parsed = validate(extractJson(choice.message && choice.message.content));
+    const text = contentToText(choice.message && choice.message.content);
+    const parsed = validate(extractJson(text));
     if (!parsed) {
-      const cut = choice.finish_reason === "length";
-      return { status: 502, body: { error: cut
-        ? "The scenario was cut off before it finished. Please try again."
-        : "The scenario came back in an unexpected format. Please try again." } };
+      const used = data.usage && data.usage.completion_tokens;
+      const finish = choice.finish_reason || "unknown";
+      console.error("Unusable reply", { version: VERSION, finish, used, head: text.slice(0, 300), tail: text.slice(-200) });
+      const info = `${VERSION}, finish=${finish}, ${used ?? "?"}/${MAX_TOKENS} tokens`;
+      return { status: 502, body: { error: finish === "length"
+        ? `The scenario was cut off before it finished (${info}). Please try again.`
+        : `The scenario came back in an unexpected format (${info}). Please try again.` } };
     }
     return { status: 200, body: parsed };
   } catch (err) {
@@ -225,4 +232,4 @@ async function run({ mode, fields, ip, apiKey }) {
   }
 }
 
-module.exports = { run };
+module.exports = { run, VERSION, MAX_TOKENS };
