@@ -193,8 +193,8 @@ function validate(o) {
 
 // ── Core ─────────────────────────────────────────────────────────────────────
 // Returns { status, body }. Wrappers only translate between platform request/response shapes.
-const VERSION = "v10";
-const MAX_TOKENS = 2000;
+const VERSION = "v11";
+const MAX_TOKENS = 3000;
 
 async function run({ mode, fields, ip, apiKey }) {
   if (!apiKey) return { status: 500, body: { error: "API key not configured on server." } };
@@ -209,11 +209,13 @@ async function run({ mode, fields, ip, apiKey }) {
 
   try {
     const body = {
-      // mistral-large-latest now resolves to Mistral Large 4, a reasoning model where
-      // "none" is NOT a valid reasoning_effort — thinking always runs and ate the whole
-      // token budget (the v8/v9 bug). Pin Large 3 instead: non-reasoning, plain-string
-      // answers, faster and cheaper. Supported until 2027-04-30.
-      model: "mistral-large-2512",
+      // Large 4 (what mistral-large-latest resolves to) is the strongest model and gives
+      // the richest scenarios, but it is a reasoning model: "none" is NOT a valid
+      // reasoning_effort for it (the v8/v9 bug — thinking ate the whole budget).
+      // "low" keeps thinking brief so the answer fits; contentToText already skips
+      // thinking chunks, so only the answer is parsed.
+      model: "mistral-large-4-0",
+      reasoning_effort: "low",
       max_tokens: MAX_TOKENS,
       temperature: 0.8,
       response_format: { type: "json_object" },
@@ -232,11 +234,11 @@ async function run({ mode, fields, ip, apiKey }) {
       return { response: r, data: await r.json() };
     };
     let { response, data } = await call(body);
-    // If Large 3 is unavailable on this plan, fall back to Large 4 with LOW reasoning
-    // (Large 4 supports only low/medium/high — "none" is invalid for it)
+    // If Large 4 is unavailable on this plan, fall back to Large 3 (non-reasoning,
+    // plain-string answers, simpler output but reliable)
     if (!response.ok && (response.status === 403 || response.status === 404 || /model/i.test(JSON.stringify(data)))) {
-      body.model = "mistral-large-4-0";
-      body.reasoning_effort = "low";
+      delete body.reasoning_effort;
+      body.model = "mistral-large-2512";
       ({ response, data } = await call(body));
     }
     if (!response.ok || !data.choices) {
