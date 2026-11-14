@@ -193,8 +193,8 @@ function validate(o) {
 
 // ── Core ─────────────────────────────────────────────────────────────────────
 // Returns { status, body }. Wrappers only translate between platform request/response shapes.
-const VERSION = "v8";
-const MAX_TOKENS = 2000;
+const VERSION = "v9";
+const MAX_TOKENS = 4000;
 
 async function run({ mode, fields, ip, apiKey }) {
   if (!apiKey) return { status: 500, body: { error: "API key not configured on server." } };
@@ -245,11 +245,14 @@ async function run({ mode, fields, ip, apiKey }) {
     if (!parsed) {
       const used = data.usage && data.usage.completion_tokens;
       const finish = choice.finish_reason || "unknown";
-      console.error("Unusable reply", { version: VERSION, finish, used, head: text.slice(0, 300), tail: text.slice(-200) });
+      // v9 diagnostics: dump the raw message so we can see where the tokens went
+      // (thinking trace, unexpected content shape, etc.)
+      const raw = JSON.stringify(choice.message || {}).slice(0, 600);
+      console.error("Unusable reply", { version: VERSION, finish, used, head: text.slice(0, 300), tail: text.slice(-200), raw });
       const info = `${VERSION}, finish=${finish}, ${used ?? "?"}/${MAX_TOKENS} tokens, ${text.length} chars`;
       return { status: 502, body: { error: finish === "length"
         ? `The scenario was cut off before it finished (${info}). Please try again.`
-        : `The scenario came back in an unexpected format (${info}). Please try again.` } };
+        : `The scenario came back in an unexpected format (${info}) [raw: ${raw}]. Please try again.` } };
     }
     return { status: 200, body: parsed };
   } catch (err) {
