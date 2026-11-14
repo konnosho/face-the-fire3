@@ -1,9 +1,9 @@
-const { run } = require("../shared/generator.js");
+const { run, VERSION, MAX_TOKENS } = require("../shared/generator.js");
 
 module.exports = async (req, res) => {
   if (req.method === "GET") {
     // Simple health check: open /api/generate in a browser. Shows no secrets.
-    return res.status(200).json({ ok: true, hasKey: Boolean(process.env.MISTRAL_API_KEY), node: process.version, hasFetch: typeof fetch === "function" });
+    return res.status(200).json({ ok: true, hasKey: Boolean(process.env.MISTRAL_API_KEY), node: process.version, hasFetch: typeof fetch === "function", version: VERSION, maxTokens: MAX_TOKENS });
   }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
   let body = req.body;
