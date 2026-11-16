@@ -193,8 +193,8 @@ function validate(o) {
 
 // ── Core ─────────────────────────────────────────────────────────────────────
 // Returns { status, body }. Wrappers only translate between platform request/response shapes.
-const VERSION = "v11";
-const MAX_TOKENS = 3000;
+const VERSION = "v12";
+const MAX_TOKENS = 8000;
 
 async function run({ mode, fields, ip, apiKey }) {
   if (!apiKey) return { status: 500, body: { error: "API key not configured on server." } };
@@ -204,18 +204,15 @@ async function run({ mode, fields, ip, apiKey }) {
 
   // Stop a little before the platform would kill the function (Vercel 60s, Netlify default 10s)
   const timeoutMs = Number(process.env.GENERATION_TIMEOUT_MS) || (process.env.VERCEL ? 55000 : 9000);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const deadline = Date.now() + timeoutMs;
 
   try {
-    const body = {
-      // Large 4 (what mistral-large-latest resolves to) is the strongest model and gives
-      // the richest scenarios, but it is a reasoning model: "none" is NOT a valid
-      // reasoning_effort for it (the v8/v9 bug — thinking ate the whole budget).
-      // "low" keeps thinking brief so the answer fits; contentToText already skips
-      // thinking chunks, so only the answer is parsed.
-      model: "mistral-large-4-0",
-      reasoning_effort: "low",
+    // Attempt 1: Large 4 (strongest output) with LOW reasoning and a large budget.
+    // Attempt 2 (automatic): Large 3, non-reasoning, plain-string answers.
+    // Large 4 is a reasoning model: "none" is invalid for it (v8/v9 bug) and even "low"
+    // has on occasion consumed the entire budget without emitting an answer, so we
+    // always have a guaranteed fallback rather than failing the user.
+    const baseBody = {
       max_tokens: MAX_TOKENS,
       temperature: 0.8,
       response_format: { type: "json_object" },
@@ -224,39 +221,54 @@ async function run({ mode, fields, ip, apiKey }) {
         { role: "user", content: buildUserPrompt(mode === "custom" ? "custom" : "random", fields || {}) },
       ],
     };
-    const call = async (b) => {
-      const r = await fetch("https://api.mistral.ai/v1/chat/completions", {
-        method: "POST",
-        signal: controller.signal,
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify(b),
-      });
-      return { response: r, data: await r.json() };
-    };
-    let { response, data } = await call(body);
-    // If Large 4 is unavailable on this plan, fall back to Large 3 (non-reasoning,
-    // plain-string answers, simpler output but reliable)
-    if (!response.ok && (response.status === 403 || response.status === 404 || /model/i.test(JSON.stringify(data)))) {
-      delete body.reasoning_effort;
-      body.model = "mistral-large-2512";
-      ({ response, data } = await call(body));
-    }
-    if (!response.ok || !data.choices) {
-      return { status: 502, body: { error: data.error?.message || data.message || "The AI service returned an error." } };
-    }
-    const choice = data.choices[0] || {};
-    const text = contentToText(choice.message && choice.message.content);
-    const parsed = validate(extractJson(text));
-    if (!parsed) {
+    const attempts = [
+      { ...baseBody, model: "mistral-large-4-0", reasoning_effort: "low" },
+      { ...baseBody, model: "mistral-large-2512" },
+    ];
+    let lastErrorInfo = "unknown";
+    for (let i = 0; i < attempts.length; i++) {
+      const body = attempts[i];
+      // Give the first attempt at most 60% of the total budget so the fallback
+      // always has time to run; abort this attempt if it exceeds its share.
+      const remaining = deadline - Date.now();
+      const share = i === 0 ? Math.floor(timeoutMs * 0.6) : remaining;
+      if (remaining < 3000) { lastErrorInfo = "out of time before fallback"; break; }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), Math.min(share, remaining));
+      let response, data;
+      try {
+        const r = await fetch("https://api.mistral.ai/v1/chat/completions", {
+          method: "POST",
+          signal: controller.signal,
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify(body),
+        });
+        data = await r.json();
+        response = r;
+      } catch (e) {
+        clearTimeout(timer);
+        if (e && e.name === "AbortError") { lastErrorInfo = `attempt ${i + 1} (${body.model}) timed out`; continue; }
+        lastErrorInfo = `attempt ${i + 1} (${body.model}) network error: ${String(e && e.message).slice(0, 120)}`;
+        continue;
+      }
+      clearTimeout(timer);
+      if (!response.ok) {
+        lastErrorInfo = `attempt ${i + 1} (${body.model}) HTTP ${response.status}: ${JSON.stringify(data).slice(0, 200)}`;
+        continue; // try the next model
+      }
+      const choice = data.choices[0] || {};
+      const text = contentToText(choice.message && choice.message.content);
+      const parsed = validate(extractJson(text));
+      if (parsed) return { status: 200, body: parsed };
+
       const used = data.usage && data.usage.completion_tokens;
       const finish = choice.finish_reason || "unknown";
-      console.error("Unusable reply", { version: VERSION, finish, used, head: text.slice(0, 300), tail: text.slice(-200) });
-      const info = `${VERSION}, finish=${finish}, ${used ?? "?"}/${MAX_TOKENS} tokens, ${text.length} chars`;
-      return { status: 502, body: { error: finish === "length"
-        ? `The scenario was cut off before it finished (${info}). Please try again.`
-        : `The scenario came back in an unexpected format (${info}). Please try again.` } };
+      const raw = JSON.stringify(choice.message || {}).slice(0, 600);
+      lastErrorInfo = `attempt ${i + 1} (${body.model}), finish=${finish}, ${used ?? "?"}/${body.max_tokens} tokens, ${text.length} chars, raw=${raw}`;
+      console.error("Unusable reply", { version: VERSION, model: body.model, finish, used, head: text.slice(0, 300), raw });
+      // otherwise fall through to the next attempt
     }
-    return { status: 200, body: parsed };
+    return { status: 502, body: { error: `The AI service could not produce a scenario (${lastErrorInfo}). Please try again.` } };
   } catch (err) {
     const timedOut = err && err.name === "AbortError";
     console.error("Mistral request failed:", err, err && err.cause);
@@ -264,8 +276,6 @@ async function run({ mode, fields, ip, apiKey }) {
     return { status: 502, body: { error: timedOut
       ? "The AI service took too long to respond. Please try again."
       : `Failed to reach AI service (${code}). Please try again.` } };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
