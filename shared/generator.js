@@ -204,8 +204,7 @@ async function run({ mode, fields, ip, apiKey }) {
 
   // Stop a little before the platform would kill the function (Vercel 60s, Netlify default 10s)
   const timeoutMs = Number(process.env.GENERATION_TIMEOUT_MS) || (process.env.VERCEL ? 55000 : 9000);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const deadline = Date.now() + timeoutMs;
 
   try {
     // Attempt 1: Large 4 (strongest output) with LOW reasoning and a large budget.
@@ -284,8 +283,6 @@ async function run({ mode, fields, ip, apiKey }) {
     return { status: 502, body: { error: timedOut
       ? "The AI service took too long to respond. Please try again."
       : `Failed to reach AI service (${code}). Please try again.` } };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
