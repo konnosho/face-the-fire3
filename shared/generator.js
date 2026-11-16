@@ -193,8 +193,8 @@ function validate(o) {
 
 // ── Core ─────────────────────────────────────────────────────────────────────
 // Returns { status, body }. Wrappers only translate between platform request/response shapes.
-const VERSION = "v13";
-const MAX_TOKENS = 8000;
+const VERSION = "v14";
+const MAX_TOKENS = 2000;
 
 async function run({ mode, fields, ip, apiKey }) {
   if (!apiKey) return { status: 500, body: { error: "API key not configured on server." } };
@@ -207,11 +207,13 @@ async function run({ mode, fields, ip, apiKey }) {
   const deadline = Date.now() + timeoutMs;
 
   try {
-    // Attempt 1: Large 4 (strongest output) with LOW reasoning and a large budget.
-    // Attempt 2 (automatic): Large 3, non-reasoning, plain-string answers.
-    // Each attempt retries once on TRANSIENT failures (network error, HTTP 429/5xx,
-    // or the server aborting mid-generation with finish=error).
-    const baseBody = {
+    // v14: Large 3 (mistral-large-2512) as the only model. It is non-reasoning, fast,
+    // reliable, and plain-string. Large 4 was removed as primary because its thinking
+    // repeatedly consumed the entire time budget even at reasoning_effort "low"
+    // (a public-preview model — revisit when Mistral stabilises it).
+    // Transient failures (network error, HTTP 429/5xx, finish=error) are retried once.
+    const body = {
+      model: "mistral-large-2512",
       max_tokens: MAX_TOKENS,
       temperature: 0.8,
       response_format: { type: "json_object" },
@@ -220,60 +222,48 @@ async function run({ mode, fields, ip, apiKey }) {
         { role: "user", content: buildUserPrompt(mode === "custom" ? "custom" : "random", fields || {}) },
       ],
     };
-    const attempts = [
-      { ...baseBody, model: "mistral-large-4-0", reasoning_effort: "low" },
-      { ...baseBody, model: "mistral-large-2512" },
-    ];
     let lastErrorInfo = "unknown";
-    for (let i = 0; i < attempts.length; i++) {
-      const body = attempts[i];
-      // Give the first attempt at most 60% of the total budget so the fallback
-      // always has time to run; abort this attempt if it exceeds its share.
+    for (let tryNo = 0; tryNo < 2; tryNo++) {
       const remaining = deadline - Date.now();
-      const share = i === 0 ? Math.floor(timeoutMs * 0.6) : remaining;
-      if (remaining < 3000) { lastErrorInfo = "out of time before fallback"; break; }
-
-      // up to 2 tries per attempt for transient failures
-      for (let tryNo = 0; tryNo < 2; tryNo++) {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), Math.min(share, deadline - Date.now()));
-        let response, data;
-        try {
-          const r = await fetch("https://api.mistral.ai/v1/chat/completions", {
-            method: "POST",
-            signal: controller.signal,
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-            body: JSON.stringify(body),
-          });
-          data = await r.json();
-          response = r;
-        } catch (e) {
-          clearTimeout(timer);
-          lastErrorInfo = `attempt ${i + 1} try ${tryNo + 1} (${body.model}) ${e && e.name === "AbortError" ? "timed out" : `network error: ${String(e && e.message).slice(0, 120)}`}`;
-          continue; // transient → retry
-        }
+      if (remaining < 3000) { lastErrorInfo = "out of time"; break; }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), remaining);
+      let response, data;
+      try {
+        const r = await fetch("https://api.mistral.ai/v1/chat/completions", {
+          method: "POST",
+          signal: controller.signal,
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify(body),
+        });
+        data = await r.json();
+        response = r;
+      } catch (e) {
         clearTimeout(timer);
-
-        if (!response.ok) {
-          const status = response.status;
-          lastErrorInfo = `attempt ${i + 1} try ${tryNo + 1} (${body.model}) HTTP ${status}: ${JSON.stringify(data).slice(0, 200)}`;
-          if (status === 429 || status >= 500) continue; // transient → retry
-          break; // permanent for this model (403/404/400) → next attempt
-        }
-
-        const choice = data.choices[0] || {};
-        const text = contentToText(choice.message && choice.message.content);
-        const parsed = validate(extractJson(text));
-        if (parsed) return { status: 200, body: parsed };
-
-        const used = data.usage && data.usage.completion_tokens;
-        const finish = choice.finish_reason || "unknown";
-        const raw = JSON.stringify(choice.message || {}).slice(0, 600);
-        lastErrorInfo = `attempt ${i + 1} try ${tryNo + 1} (${body.model}), finish=${finish}, ${used ?? "?"}/${body.max_tokens} tokens, ${text.length} chars, raw=${raw}`;
-        console.error("Unusable reply", { version: VERSION, model: body.model, finish, used, head: text.slice(0, 300), raw });
-        if (finish === "error" || finish === "length") continue; // transient/server-side → retry
-        break; // genuinely malformed answer → next attempt
+        lastErrorInfo = `try ${tryNo + 1} ${e && e.name === "AbortError" ? "timed out" : `network error: ${String(e && e.message).slice(0, 120)}`}`;
+        continue; // transient → retry
       }
+      clearTimeout(timer);
+
+      if (!response.ok) {
+        const status = response.status;
+        lastErrorInfo = `try ${tryNo + 1} HTTP ${status}: ${JSON.stringify(data).slice(0, 200)}`;
+        if (status === 429 || status >= 500) continue; // transient → retry
+        break; // permanent (403/404/400) → stop
+      }
+
+      const choice = data.choices[0] || {};
+      const text = contentToText(choice.message && choice.message.content);
+      const parsed = validate(extractJson(text));
+      if (parsed) return { status: 200, body: parsed };
+
+      const used = data.usage && data.usage.completion_tokens;
+      const finish = choice.finish_reason || "unknown";
+      const raw = JSON.stringify(choice.message || {}).slice(0, 600);
+      lastErrorInfo = `try ${tryNo + 1}, finish=${finish}, ${used ?? "?"}/${MAX_TOKENS} tokens, ${text.length} chars, raw=${raw}`;
+      console.error("Unusable reply", { version: VERSION, finish, used, head: text.slice(0, 300), raw });
+      if (finish === "error" || finish === "length") continue; // transient/server-side → retry
+      break; // genuinely malformed answer → stop
     }
     return { status: 502, body: { error: `The AI service could not produce a scenario (${lastErrorInfo}). Please try again.` } };
   } catch (err) {
